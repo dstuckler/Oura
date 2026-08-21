@@ -62,6 +62,18 @@ SCOPES = ["personal", "daily", "heartrate", "session", "spo2", "workout", "tag"]
 
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
+
+def _unset(value: str) -> bool:
+    """True when a setting has not really been filled in yet.
+
+    Setup asks for the literal word "placeholder" in Render, because the Oura
+    app cannot be registered until this service has a URL. A plain emptiness
+    check treats "placeholder" as configured and sends the user to Oura with
+    client_id=placeholder, which fails there with a message that explains
+    nothing. Catch it here instead, where we can say what to do.
+    """
+    return not value or value.strip().lower() == "placeholder"
+
 # --- Token storage ---------------------------------------------------------
 # One file on the persistent disk. Written 0600: on a shared host the default
 # umask would leave a live health credential world-readable.
@@ -532,11 +544,12 @@ async def auth_start(request: Request) -> Any:
         return PlainTextResponse("Not found", status_code=404)
     missing = [n for n, v in (("OURA_CLIENT_ID", CLIENT_ID),
                               ("OURA_CLIENT_SECRET", CLIENT_SECRET),
-                              ("PUBLIC_URL", PUBLIC_URL)) if not v]
+                              ("PUBLIC_URL", PUBLIC_URL)) if _unset(v)]
     if missing:
         return PlainTextResponse(
-            "Not configured. Set these in Render, then redeploy: "
-            + ", ".join(missing), status_code=500)
+            "Not configured yet. Set these in the Render dashboard under "
+            "Environment, replacing the placeholder values, then wait for the "
+            "redeploy: " + ", ".join(missing), status_code=500)
     state = secrets.token_urlsafe(24)
     _save_state(state)
     url = f"{OURA_AUTHORIZE_URL}?" + urlencode({
