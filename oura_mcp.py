@@ -24,7 +24,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -739,6 +739,15 @@ class RequireSecret:
         presented = headers.get("authorization", "")
         if presented.lower().startswith("bearer "):
             presented = presented[7:].strip()
+        # Fall back to ?key= in the URL. Claude's mobile "add custom connector"
+        # form offers a URL and OAuth credentials, with nowhere to set a static
+        # header, so a header-only gate cannot be configured from a phone at
+        # all. The query string is the only channel that surface gives us.
+        # Weaker, since URLs reach logs and browser history, but the
+        # alternative is either no connector or no lock.
+        if not _secret_ok(presented):
+            qs = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            presented = (qs.get("key") or [""])[0]
         if not _secret_ok(presented):
             log.warning("rejected unauthenticated request to %s", path)
             await send({"type": "http.response.start", "status": 404,
