@@ -5,8 +5,8 @@ connector, each user authenticating with their own Oura account, no health
 data stored by the operator.**
 
 This file records what was actually verified, what was not, and what stands
-between the proof and something other people can use. `oauth_poc.py` is the
-throwaway that established it.
+between the proof and something other people can use. `oura_multiuser.py` implements it; the throwaway that
+established it has been removed rather than left to drift.
 
 ## The problem it solves
 
@@ -55,8 +55,12 @@ honestly.
 
 ## Remaining work
 
-1. **Port the 14 tools** from `oura_mcp.py`. Same bodies; the token comes
-   from `get_access_token()` on the request instead of from disk.
+1. ~~Port the 14 tools.~~ Done. `oura_multiuser.py` registers the same
+   function objects `oura_mcp.py` exposes, with the token source swapped
+   through the `TOKEN_PROVIDER` hook. There is no second copy of any tool
+   body. Verified: two different callers in one process each get their own
+   token forwarded, and a caller with no session gets an error rather than
+   falling back to the operator's stored token.
 2. **Persist client registrations.** The only genuine engineering left. A
    small store of client IDs, holding no tokens and no health data, so a
    restart does not sign everybody out.

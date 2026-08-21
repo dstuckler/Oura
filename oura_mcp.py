@@ -166,7 +166,20 @@ async def _refresh(tok: dict) -> dict:
     return _store_token_response(payload)
 
 
+# Where the Oura token comes from. None means the disk store below, which is
+# the single-user server's own behaviour and the default.
+#
+# oura_multiuser.py sets this to read the token off the incoming request
+# instead, so one hosted server can serve many people without holding anyone's
+# credentials. Every tool in this file then works unchanged under either
+# model: the tools never ask where the token came from, and there is no second
+# copy of them to drift out of step with this one.
+TOKEN_PROVIDER = None
+
+
 async def _access_token() -> str:
+    if TOKEN_PROVIDER is not None:
+        return await TOKEN_PROVIDER()
     tok = _load_tokens()
     if not tok:
         raise RuntimeError(
