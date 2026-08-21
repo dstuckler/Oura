@@ -1,0 +1,7 @@
+# <2: mcp 2.0.0 removed mcp.server.fastmcp, the import this server is built
+# on. The same unpinned upgrade already killed a Render deploy on
+# fasttrack-literature-mcp. Both repos stay on 1.x and migrate together,
+# deliberately, never via a surprise resolver upgrade.
+mcp>=1.28,<2
+httpx>=0.27
+uvicorn>=0.30
