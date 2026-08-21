@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -850,6 +851,7 @@ ENDPOINTS = {
     "enhanced_tag": "structured user-entered tags",
     "rest_mode_period": "rest mode periods",
     "ring_configuration": "ring hardware, including generation",
+    "ring_battery_level": "current ring battery",
     "personal_info": "account profile",
     "heartrate": "continuous heart rate samples (uses datetimes)",
 }
@@ -857,7 +859,8 @@ ENDPOINTS = {
 # heartrate is bounded by timestamps, every other collection by dates.
 _DATETIME_ENDPOINTS = {"heartrate"}
 # These carry no date range at all; sending one returns a 400.
-_UNDATED_ENDPOINTS = {"personal_info", "ring_configuration"}
+_UNDATED_ENDPOINTS = {"personal_info", "ring_configuration",
+                      "ring_battery_level"}
 
 
 @mcp.tool()
@@ -1063,6 +1066,100 @@ async def get_sessions(start_date: str | None = None,
         except Exception as e:
             return _err(e)
     return out
+
+
+def _utc_offset(timestamp: Any) -> str | None:
+    """The trailing +HH:MM or -HH:MM on an ISO 8601 timestamp."""
+    if not isinstance(timestamp, str):
+        return None
+    m = re.search(r"([+-]\d{2}:\d{2})$", timestamp)
+    return m.group(1) if m else None
+
+
+def _offset_hours(offset: str) -> float:
+    sign = -1 if offset.startswith("-") else 1
+    hh, mm = offset[1:].split(":")
+    return sign * (int(hh) + int(mm) / 60)
+
+
+@mcp.tool()
+async def find_travel_periods(start_date: str | None = None,
+                              end_date: str | None = None,
+                              min_nights: int = 1) -> dict:
+    """Work out which nights were spent away, from timezone changes alone.
+
+    Use this before compare_periods when the question is about travel, so the
+    date ranges come from the record rather than from memory.
+
+    Oura stores no location: the ring has no GPS and the API exposes no
+    latitude, city or country. What it does store is the UTC offset on each
+    night's bedtime, so crossing a timezone is visible even though the place
+    is not. The offset seen on the most nights is treated as home, and each
+    run of nights at a different offset is reported as a trip.
+
+    This misses any travel that does not change timezone, so a trip within
+    one country looks identical to being at home, and a night that merely
+    crosses a daylight-saving change will show up as a spurious one-night
+    trip. Treat the output as a prompt to confirm, not as a record of where
+    you were. Dates are YYYY-MM-DD, default the last 180 days."""
+    start_date, end_date = _dates(start_date, end_date, default_days=180)
+    try:
+        sleep = await _get("/usercollection/sleep",
+                           {"start_date": start_date, "end_date": end_date})
+        main, _ = _main_sleep(sleep.get("data", []))
+        nights = [(day, _utc_offset(main[day].get("bedtime_start")))
+                  for day in sorted(main)]
+        nights = [(d, o) for d, o in nights if o]
+        if not nights:
+            return {"error": "No sleep records with a timezone in this range."}
+
+        counts: dict[str, int] = {}
+        for _, o in nights:
+            counts[o] = counts.get(o, 0) + 1
+        home = max(counts, key=lambda k: counts[k])
+
+        # Collapse consecutive nights sharing an offset into one run.
+        runs = []
+        for day, off in nights:
+            if runs and runs[-1]["utc_offset"] == off:
+                runs[-1]["end_day"] = day
+                runs[-1]["nights"] += 1
+            else:
+                runs.append({"start_day": day, "end_day": day,
+                             "utc_offset": off, "nights": 1})
+
+        trips = [{**r,
+                  "hours_from_home": round(
+                      _offset_hours(r["utc_offset"]) - _offset_hours(home), 1),
+                  "direction": ("east" if _offset_hours(r["utc_offset"])
+                                > _offset_hours(home) else "west")}
+                 for r in runs
+                 if r["utc_offset"] != home and r["nights"] >= min_nights]
+
+        out = {
+            "range": f"{start_date} to {end_date}",
+            "nights_analysed": len(nights),
+            "home_offset": home,
+            "home_nights": counts[home],
+            "trips": trips,
+            "trip_count": len(trips),
+            "offsets_seen": counts,
+        }
+        thin = [t for t in trips if t["nights"] < 3]
+        if thin:
+            out["caution"] = (
+                "Trips of fewer than 3 nights are listed but are too short to "
+                "compare against a baseline: night-to-night variation alone "
+                "will usually exceed any real difference. "
+                + ", ".join(f"{t['start_day']} ({t['nights']} night"
+                            f"{'s' if t['nights'] != 1 else ''})" for t in thin))
+        if not trips:
+            out["note"] = ("Every night in this range shares one timezone. "
+                           "That means no travel across timezones, not "
+                           "necessarily no travel.")
+        return out
+    except Exception as e:
+        return _err(e)
 
 
 if __name__ == "__main__":
