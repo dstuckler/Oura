@@ -220,8 +220,21 @@ def _err(e: Exception) -> dict:
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
         if code == 401:
-            return {"error": "Oura rejected the stored login. Open the "
-                             "/auth/start link in a browser to reconnect."}
+            # Oura answers 401, not the documented 403, when a collection is
+            # outside the granted scopes. Telling the user only to reconnect
+            # sends them round the same loop: re-consent regrants exactly the
+            # scopes the app registration allows, so if the tick is missing
+            # there, nothing changes. Name both causes and how to tell them
+            # apart.
+            return {"error": (
+                "Oura returned 401 for this collection. If other tools still "
+                "work, the stored login is fine and this is a missing scope: "
+                "the app registration does not grant this data type. Check "
+                "the scopes on the app at developer.ouraring.com, tick the "
+                "missing one, then open /auth/start again to re-consent. "
+                "spo2Daily covers SpO2 and breathing. If every tool returns "
+                "this, the login itself has gone and re-consenting alone "
+                "fixes it.")}
         if code == 403:
             return {"error": "Oura returned 403. This normally means the ring "
                              "membership has lapsed, since API access requires "
