@@ -270,40 +270,70 @@ def _dates(start_date: str | None, end_date: str | None, default_days: int = 7):
 
 
 class _Fields:
-    """Reads nested values and remembers which ones were absent.
+    """Reads nested values, separating a renamed field from an empty one.
 
-    The Oura v2 field names could not be verified while this was written, so
-    every tool reports what it could not find instead of returning a tidy row
-    of nulls. A null reads as "you slept badly and we have no numbers"; an
-    explicit miss reads as "the API changed", which is the truth and is
-    actionable. See fields_checked in every response.
+    Two different things look alike in a tidied row of nulls, and only one is
+    a fault:
+
+    absent  - the key is not in the record at all. Across a whole response
+              that means the API has been renamed and the tool is reading a
+              field that no longer exists. Actionable, and worth shouting
+              about.
+    null    - the key is there and its value is null. Oura did not compute
+              that metric for that night, which is ordinary: a night with no
+              breathing disturbance index sits beside nights that have one.
+
+    Reporting a null as drift is not harmless. A warning that fires on normal
+    data teaches the reader to ignore it, and it is the same warning that
+    would carry a real rename. So a key seen with a value somewhere in the
+    response is never reported as missing, however many nulls it also has.
     """
 
     def __init__(self) -> None:
-        self.missing: set[str] = set()
+        self.absent: set[str] = set()
+        self.nulls: set[str] = set()
+        self.seen: set[str] = set()
 
     def pick(self, obj: Any, *path: str, default: Any = None) -> Any:
+        name = ".".join(path)
         cur = obj
         for key in path:
             if not isinstance(cur, dict) or key not in cur:
-                self.missing.add(".".join(path))
+                self.absent.add(name)
                 return default
             cur = cur[key]
         if cur is None:
-            self.missing.add(".".join(path))
+            self.nulls.add(name)
+        else:
+            self.seen.add(name)
         return cur
 
     def report(self) -> dict:
-        if not self.missing:
-            return {"fields_checked": "all expected fields present"}
-        return {
-            "fields_checked": "SOME EXPECTED FIELDS WERE MISSING",
-            "missing_fields": sorted(self.missing),
-            "note": ("Oura's field names may have changed since this connector "
-                     "was written. Compare the names above against "
-                     "https://api.ouraring.com/v2/docs and update oura_mcp.py. "
-                     "Do not read a missing field as a low reading."),
-        }
+        # A field that produced a value anywhere is present; the nulls are
+        # gaps in the data, not evidence of a rename.
+        drifted = sorted(self.absent - self.seen)
+        # Any field that was ever null, or absent on some records while
+        # present on others, is a gap worth naming. Subtracting `seen` here
+        # would erase exactly the interesting case: a metric Oura computes on
+        # most nights and skips on one.
+        gaps = sorted(self.nulls | (self.absent & self.seen))
+        out: dict = {}
+        if drifted:
+            out["fields_checked"] = "SOME EXPECTED FIELDS WERE MISSING"
+            out["missing_fields"] = drifted
+            out["note"] = (
+                "These field names were not present on any record, which "
+                "usually means Oura renamed them. Compare against "
+                "https://api.ouraring.com/v2/docs and update oura_mcp.py. "
+                "Do not read a missing field as a low reading.")
+        else:
+            out["fields_checked"] = "all expected fields present"
+        if gaps:
+            out["fields_null_on_some_records"] = gaps
+            out["gap_note"] = ("Present in the response but not computed for "
+                               "every record. A normal gap in the data, not a "
+                               "renamed field and not a low reading.")
+        return out
 
 
 def _mean(values: list[float]) -> float | None:
