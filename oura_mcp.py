@@ -900,17 +900,27 @@ async def list_available_data() -> dict:
 
 @mcp.tool()
 async def get_raw(endpoint: str, start_date: str | None = None,
-                  end_date: str | None = None) -> dict:
+                  end_date: str | None = None, sandbox: bool = False) -> dict:
     """Fetch any Oura v2 collection and return its response unchanged.
 
     The escape hatch: use it for data with no dedicated tool, or to see the
     real field names when a tidied tool reports missing fields. Call
     list_available_data for valid endpoint names. Dates are YYYY-MM-DD and are
-    ignored for collections that do not accept a range."""
+    ignored for collections that do not accept a range.
+
+    sandbox=True hits Oura's sample-data namespace instead of the real record.
+    Useful as a diagnostic: if a collection fails on real data but works in
+    the sandbox, the request and parsing are sound and the fault is in what
+    the token is permitted to read. The values are Oura's fixtures, not
+    yours, so never present them as the user's own readings."""
     name = endpoint.strip().strip("/").split("/")[-1]
     if name not in ENDPOINTS:
         return {"error": f"Unknown endpoint '{endpoint}'.",
                 "valid_endpoints": sorted(ENDPOINTS)}
+    # personal_info has no sandbox counterpart in the spec.
+    if sandbox and name == "personal_info":
+        return {"error": "personal_info has no sandbox route."}
+    prefix = "/sandbox/usercollection" if sandbox else "/usercollection"
     try:
         if name in _UNDATED_ENDPOINTS:
             params: dict = {}
@@ -921,11 +931,15 @@ async def get_raw(endpoint: str, start_date: str | None = None,
         else:
             s, e = _dates(start_date, end_date)
             params = {"start_date": s, "end_date": e}
-        data = await _get(f"/usercollection/{name}", params)
+        data = await _get(f"{prefix}/{name}", params)
         records = data.get("data", data) if isinstance(data, dict) else data
-        return {"endpoint": name, "params": params,
-                "record_count": len(records) if isinstance(records, list) else 1,
-                "data": data}
+        out = {"endpoint": name, "params": params,
+               "record_count": len(records) if isinstance(records, list) else 1,
+               "data": data}
+        if sandbox:
+            out["source"] = ("Oura sandbox fixtures, NOT this user's data. "
+                             "Do not report these as real readings.")
+        return out
     except Exception as e:
         return _err(e)
 
