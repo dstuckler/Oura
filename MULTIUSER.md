@@ -44,8 +44,12 @@ The user added a URL and logged in. That was the whole setup.
 
 ## The claim to make, and the one not to
 
-"Your data is never stored" is true: nothing is written to disk or a
-database, and the token lives in the user's own client.
+"We never store your Oura login or your health data" is true: tokens live in
+the user's own client and health data is read, returned and discarded.
+
+"We store nothing" is now slightly too strong. One file is written: the list
+of registered OAuth clients, holding no credential of the user's and no
+health data, without which every user is signed out on each restart.
 
 "Your data never touches our servers" is **false** and must not be written
 anywhere. Tokens and health data pass through memory on every call. The
@@ -61,9 +65,14 @@ honestly.
    body. Verified: two different callers in one process each get their own
    token forwarded, and a caller with no session gets an error rather than
    falling back to the operator's stored token.
-2. **Persist client registrations.** The only genuine engineering left. A
-   small store of client IDs, holding no tokens and no health data, so a
-   restart does not sign everybody out.
+2. ~~Persist client registrations.~~ Done, and it was the cause of the
+   daily re-login rather than token expiry. The token endpoint authenticates
+   the client with `get_client()` before it will refresh anything, so a
+   restart that lost the registration had refreshes rejected as
+   `Invalid client_id` and the user was asked to sign in again. Their refresh
+   token had been valid throughout. Registrations now live on a Render disk
+   at `/var/data`, written 0600 through a temp file and rename. Verified to
+   survive a restart and to contain no access or refresh token.
 3. **Oura app approval**, to pass 10 users. Start early; it is someone
    else's timeline.
 4. **Rename the app.** The consent screen currently reads "Oura Personal

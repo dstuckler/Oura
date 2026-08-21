@@ -25,26 +25,35 @@ the drift would be silent.
 
 What this does and does not claim
 ---------------------------------
-Nothing is stored: no token, no health record, no database, no disk. That
-claim is true and is the point of the design.
+No token and no health record is stored. Tokens live in the user's own Claude
+and are forwarded on each call; health data is read, returned and discarded.
+That is the point of the design and it holds.
 
-Data still passes through this process in memory on every call. "We never
+One thing is written to disk: the list of registered OAuth clients, meaning
+"this Claude installation is known to us". It has to be, because the token
+endpoint authenticates the client before it will refresh anything, so losing
+it on restart forces every user to log in again. It contains no credential of
+the user's and no health data.
+
+So the precise claim is "we never store your Oura login or your health data",
+not "we store nothing". Both are worth saying accurately.
+
+Data also passes through this process in memory on every call. "We never
 store your data" is honest; "your data never touches our servers" would not
 be. Never log request or response bodies, and say the true version in any
 privacy policy.
 
-Known limits, both real:
-  - Registered clients live in memory, so a restart signs everyone out. This
-    is the piece that must be persisted before real use. See MULTIUSER.md.
-  - Oura caps an unapproved application at 10 users.
+Remaining limit: Oura caps an unapproved application at 10 users.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -78,6 +87,22 @@ TIMEOUT = core.HTTP_TIMEOUT
 STATE_TTL = 600
 CODE_TTL = 300
 
+# Where registered clients are kept across restarts. This is the one thing
+# here that must survive, and it is deliberately the only one.
+#
+# Why it has to persist: the token endpoint authenticates the client with
+# get_client() before it will refresh anything. Held only in memory, a restart
+# loses the registration, the refresh is rejected as Invalid client_id, and
+# the user is asked to log in again. Their refresh token was valid throughout;
+# the server had simply forgotten who was asking. That is the daily re-login.
+#
+# What is in here: client ids and their redirect URIs, meaning "this Claude
+# installation is known to us". No access token, no refresh token, no health
+# data. Those still live only in the user's own client, which is the whole
+# design and does not change.
+CLIENT_STORE = Path(os.environ.get("CLIENT_STORE",
+                                   "/var/data/oauth_clients.json"))
+
 
 async def _token_from_request() -> str:
     """The caller's own Oura token, taken off this request.
@@ -96,11 +121,57 @@ async def _token_from_request() -> str:
 core.TOKEN_PROVIDER = _token_from_request
 
 
+def _load_clients() -> dict[str, OAuthClientInformationFull]:
+    """Read known clients back after a restart.
+
+    A missing or unreadable file is not fatal: the server starts empty and
+    people re-authenticate once. Refusing to boot over it would turn a
+    recoverable annoyance into an outage.
+    """
+    try:
+        raw = json.loads(CLIENT_STORE.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("client store unreadable (%s); starting empty",
+                    type(e).__name__)
+        return {}
+    out: dict[str, OAuthClientInformationFull] = {}
+    for cid, data in raw.items():
+        try:
+            out[cid] = OAuthClientInformationFull.model_validate(data)
+        except Exception:  # noqa: BLE001 - one bad row must not lose the rest
+            log.warning("dropping unreadable client record")
+    log.info("loaded %d known clients", len(out))
+    return out
+
+
+def _save_clients(clients: dict[str, OAuthClientInformationFull]) -> None:
+    try:
+        CLIENT_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CLIENT_STORE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {cid: c.model_dump(mode="json") for cid, c in clients.items()}))
+        os.chmod(tmp, 0o600)
+        # Rename, so a crash mid-write cannot leave a half-file that reads as
+        # "nobody is registered" and signs everyone out.
+        tmp.replace(CLIENT_STORE)
+    except OSError as e:
+        # Losing the write costs a future re-login, not this session. Staying
+        # up is better than failing the registration in front of the user.
+        log.warning("could not persist clients (%s); memory only",
+                    type(e).__name__)
+
+
 class OuraBroker(OAuthAuthorizationServerProvider):
-    """Brokers Claude's OAuth flow onto Oura's, keeping nothing durable."""
+    """Brokers Claude's OAuth flow onto Oura's.
+
+    Client registrations persist; nothing else does. No token and no health
+    record is written here or anywhere else by this server.
+    """
 
     def __init__(self) -> None:
-        self.clients: dict[str, OAuthClientInformationFull] = {}
+        self.clients: dict[str, OAuthClientInformationFull] = _load_clients()
         self.flows: dict[str, tuple[OAuthClientInformationFull,
                                     AuthorizationParams, float]] = {}
         self.codes: dict[str, tuple[AuthorizationCode, dict]] = {}
@@ -110,7 +181,9 @@ class OuraBroker(OAuthAuthorizationServerProvider):
 
     async def register_client(self, client_info: OAuthClientInformationFull):
         self.clients[client_info.client_id] = client_info
-        log.info("registered client %s", client_info.client_id)
+        _save_clients(self.clients)
+        log.info("registered client %s (%d known)",
+                 client_info.client_id, len(self.clients))
 
     async def authorize(self, client: OAuthClientInformationFull,
                         params: AuthorizationParams) -> str:
@@ -314,7 +387,8 @@ async def health(request: Request) -> PlainTextResponse:
     these are sizes of in-memory dicts, not users."""
     return PlainTextResponse(
         f"ok multiuser {core.VERSION} tools={len(TOOLS)} "
-        f"clients={len(broker.clients)} flows={len(broker.flows)}")
+        f"clients={len(broker.clients)} flows={len(broker.flows)} "
+        f"store={'ok' if CLIENT_STORE.parent.exists() else 'MISSING'}")
 
 
 if __name__ == "__main__":
