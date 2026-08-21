@@ -299,6 +299,38 @@ def _mean(values: list[float]) -> float | None:
     return round(sum(vals) / len(vals), 2) if vals else None
 
 
+def _main_sleep(records: list[dict]) -> tuple[dict[str, dict], list[dict]]:
+    """Split sleep periods into one main night per day, and everything else.
+
+    The sleep collection returns a record per sleep *period*, not per night.
+    A day with a nap or a brief re-settle carries two or three, typed
+    "long_sleep" for the real night and "sleep" for the rest. Treating them
+    alike does three bad things: the same date appears twice, a day-keyed
+    lookup silently keeps whichever record came last, and an average over
+    periods weights a 30-second fragment the same as an eight-hour night.
+
+    Short fragments also carry average_breath: null, so counting them makes
+    the missing-field report cry drift when nothing has drifted.
+
+    Prefer the long_sleep period; where a day has none, fall back to its
+    longest period so a nap-only day still reports something.
+    """
+    def rank(r: dict) -> tuple:
+        return (r.get("type") == "long_sleep",
+                r.get("total_sleep_duration") or 0)
+
+    best: dict[str, dict] = {}
+    for r in records:
+        day = r.get("day")
+        if day is None:
+            continue
+        if day not in best or rank(r) > rank(best[day]):
+            best[day] = r
+    chosen = {id(r) for r in best.values()}
+    others = [r for r in records if id(r) not in chosen]
+    return best, others
+
+
 # --- MCP server ------------------------------------------------------------
 
 _INSTRUCTIONS = (
@@ -371,24 +403,40 @@ async def get_sleep(start_date: str | None = None,
         # rem, latency, restfulness or timing pulled it down.
         contribs = {d.get("day"): d.get("contributors")
                     for d in summary.get("data", [])}
+        main, naps = _main_sleep(detail.get("data", []))
         nights = []
-        for d in detail.get("data", []):
-            day = f.pick(d, "day")
+        for day in sorted(main):
+            d = main[day]
             nights.append({
                 "day": day,
+                "sleep_type": d.get("type"),
                 "sleep_score": scores.get(day),
                 "total_sleep_hours": _hours(f.pick(d, "total_sleep_duration")),
                 "deep_sleep_hours": _hours(f.pick(d, "deep_sleep_duration")),
                 "rem_sleep_hours": _hours(f.pick(d, "rem_sleep_duration")),
+                "light_sleep_hours": _hours(f.pick(d, "light_sleep_duration")),
                 "awake_hours": _hours(f.pick(d, "awake_time")),
+                "time_in_bed_hours": _hours(f.pick(d, "time_in_bed")),
                 "efficiency_pct": f.pick(d, "efficiency"),
+                "latency_minutes": _mins(f.pick(d, "latency")),
+                "restless_periods": f.pick(d, "restless_periods"),
                 "average_heart_rate": f.pick(d, "average_heart_rate"),
+                "lowest_heart_rate": f.pick(d, "lowest_heart_rate"),
                 "average_hrv": f.pick(d, "average_hrv"),
                 "respiratory_rate": f.pick(d, "average_breath"),
+                "bedtime_start": d.get("bedtime_start"),
+                "bedtime_end": d.get("bedtime_end"),
                 "score_contributors": contribs.get(day),
             })
-        return {"start_date": start_date, "end_date": end_date,
-                "nights": nights, "night_count": len(nights), **f.report()}
+        out = {"start_date": start_date, "end_date": end_date,
+               "nights": nights, "night_count": len(nights), **f.report()}
+        if naps:
+            # Reported separately rather than dropped: a nap is real data, it
+            # just is not a night and must not be averaged as one.
+            out["naps_and_fragments"] = [
+                {"day": n.get("day"), "type": n.get("type"),
+                 "hours": _hours(n.get("total_sleep_duration"))} for n in naps]
+        return out
     except Exception as e:
         return _err(e)
 
@@ -442,8 +490,11 @@ async def get_breathing(start_date: str | None = None,
         sleep = await _get("/usercollection/sleep",
                            {"start_date": start_date, "end_date": end_date})
         f = _Fields()
-        breath = {f.pick(d, "day"): f.pick(d, "average_breath")
-                  for d in sleep.get("data", [])}
+        # Main night only. Keying every period by day let a late fragment,
+        # which carries no average_breath, overwrite the real night's value
+        # and report the respiratory rate as missing.
+        main, _ = _main_sleep(sleep.get("data", []))
+        breath = {day: f.pick(d, "average_breath") for day, d in main.items()}
         nights = []
         for d in spo2.get("data", []):
             day = f.pick(d, "day")
@@ -568,7 +619,12 @@ async def _period_means(start: str, end: str) -> dict:
                        {"start_date": start, "end_date": end})
     spo2 = await _get("/usercollection/daily_spo2",
                       {"start_date": start, "end_date": end})
-    nights = sleep.get("data", [])
+    # One night per day. Averaging raw periods let a 30-second fragment, with
+    # an efficiency near zero and no respiratory rate, count as heavily as a
+    # full night: over a short comparison window that alone can invent a
+    # difference between two periods.
+    main, _ = _main_sleep(sleep.get("data", []))
+    nights = list(main.values())
     means = {
         "sleep_score": _mean([f.pick(d, "score") for d in daily.get("data", [])]),
         "total_sleep_hours": _mean(
