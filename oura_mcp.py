@@ -59,12 +59,23 @@ OURA_AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
 OURA_TOKEN_URL = "https://api.ouraring.com/oauth/token"
 OURA_API = "https://api.ouraring.com/v2"
 
-# Exactly as published in the v2 docs. Note "spo2Daily", not "spo2": the
-# wrong spelling is accepted at the consent screen but grants nothing, so
-# daily_spo2 comes back empty and looks like a ring or field-name problem.
-# "email" is needed because check_connection reads it from personal_info.
+# The first seven are confirmed working: they are exactly the seven items
+# Oura's consent screen offered, and every collection behind them returns
+# data.
+#
+# Both SpO2 spellings are requested deliberately. The published spec and docs
+# say "spo2Daily"; other sources say "spo2", and the checkbox in the developer
+# portal is labelled plain "SpO2". Requesting spo2Daily alone produced a
+# consent screen with no SpO2 item at all and no error, which is what an
+# unrecognised scope looks like: Oura drops what it does not know rather than
+# rejecting the request. That same silence makes sending both safe, since the
+# wrong one can only be ignored, and it settles the question in one consent
+# instead of two.
+#
+# If the consent screen gains an SpO2 item, the surviving spelling is the real
+# one and the other can be dropped.
 SCOPES = ["email", "personal", "daily", "heartrate", "workout", "tag",
-          "session", "spo2Daily"]
+          "session", "spo2Daily", "spo2"]
 
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
