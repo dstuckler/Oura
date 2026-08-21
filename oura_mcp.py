@@ -700,29 +700,6 @@ class RequireSecret:
         await self.app(scope, receive, send)
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    # Refuse to start rather than serve a health record with no lock on the
-    # door. A missing secret is a deployment mistake, and the safe response to
-    # it is to stay down and be noticed, not to come up open.
-    if not MCP_SECRET:
-        raise SystemExit(
-            "MCP_SECRET is not set. Refusing to start: without it the tools "
-            "would be readable by anyone who finds this URL. Set MCP_SECRET "
-            "in the Render dashboard to a long random string."
-        )
-    if len(MCP_SECRET) < 24:
-        raise SystemExit(
-            f"MCP_SECRET is only {len(MCP_SECRET)} characters. Use at least 24 "
-            "random characters, this is the sole protection on your health data."
-        )
-    if not PUBLIC_URL.startswith("https://"):
-        log.warning("PUBLIC_URL is not https, the OAuth redirect will fail")
-
-    app = RequireSecret(mcp.streamable_http_app())
-    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
-
 
 # --- Wider data coverage ---------------------------------------------------
 # Everything Oura v2 exposes, not just the sleep and breathing subset. The
@@ -941,3 +918,27 @@ async def get_sessions(start_date: str | None = None,
         except Exception as e:
             return _err(e)
     return out
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Refuse to start rather than serve a health record with no lock on the
+    # door. A missing secret is a deployment mistake, and the safe response to
+    # it is to stay down and be noticed, not to come up open.
+    if not MCP_SECRET:
+        raise SystemExit(
+            "MCP_SECRET is not set. Refusing to start: without it the tools "
+            "would be readable by anyone who finds this URL. Set MCP_SECRET "
+            "in the Render dashboard to a long random string."
+        )
+    if len(MCP_SECRET) < 24:
+        raise SystemExit(
+            f"MCP_SECRET is only {len(MCP_SECRET)} characters. Use at least 24 "
+            "random characters, this is the sole protection on your health data."
+        )
+    if not PUBLIC_URL.startswith("https://"):
+        log.warning("PUBLIC_URL is not https, the OAuth redirect will fail")
+
+    app = RequireSecret(mcp.streamable_http_app())
+    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
