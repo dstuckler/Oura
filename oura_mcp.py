@@ -58,9 +58,18 @@ OURA_AUTHORIZE_URL = "https://cloud.ouraring.com/oauth/authorize"
 OURA_TOKEN_URL = "https://api.ouraring.com/oauth/token"
 OURA_API = "https://api.ouraring.com/v2"
 
-SCOPES = ["personal", "daily", "heartrate", "session", "spo2", "workout", "tag"]
+# Exactly as published in the v2 docs. Note "spo2Daily", not "spo2": the
+# wrong spelling is accepted at the consent screen but grants nothing, so
+# daily_spo2 comes back empty and looks like a ring or field-name problem.
+# "email" is needed because check_connection reads it from personal_info.
+SCOPES = ["email", "personal", "daily", "heartrate", "workout", "tag",
+          "session", "spo2Daily"]
 
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+
+# Pagination guard. Oura allows 5000 requests per 5 minutes; this bounds a
+# single tool call well inside that even on a multi-year range.
+MAX_PAGES = 50
 
 
 def _unset(value: str) -> bool:
@@ -165,18 +174,39 @@ async def _get(path: str, params: dict) -> dict:
     401 in case the access token expired between our check and the call."""
     token = await _access_token()
     url = f"{OURA_API}{path}"
+    merged: dict | None = None
+    page_params = dict(params)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url, params=params,
-                             headers={"Authorization": f"Bearer {token}"})
-        if r.status_code == 401:
-            tok = _load_tokens()
-            if tok:
-                tok = await _refresh(tok)
-                r = await client.get(
-                    url, params=params,
-                    headers={"Authorization": f"Bearer {tok['access_token']}"})
-        r.raise_for_status()
-        return r.json()
+        for page in range(MAX_PAGES):
+            r = await client.get(url, params=page_params,
+                                 headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 401:
+                tok = _load_tokens()
+                if tok:
+                    tok = await _refresh(tok)
+                    token = tok["access_token"]
+                    r = await client.get(
+                        url, params=page_params,
+                        headers={"Authorization": f"Bearer {token}"})
+            r.raise_for_status()
+            body = r.json()
+            if merged is None:
+                merged = body
+            elif isinstance(body.get("data"), list):
+                merged["data"].extend(body["data"])
+            # Oura paginates multi-document responses. Stopping at the first
+            # page silently truncates a wide range, which reads as "you have
+            # no data for those days" rather than "there is more".
+            nxt = body.get("next_token") if isinstance(body, dict) else None
+            if not nxt or not isinstance(merged.get("data"), list):
+                break
+            page_params = {**params, "next_token": nxt}
+        else:
+            log.warning("hit MAX_PAGES on %s; response is truncated", path)
+            if isinstance(merged, dict):
+                merged["truncated"] = True
+    merged.pop("next_token", None)
+    return merged
 
 
 def _err(e: Exception) -> dict:
@@ -324,6 +354,10 @@ async def get_sleep(start_date: str | None = None,
         f = _Fields()
         scores = {f.pick(d, "day"): f.pick(d, "score")
                   for d in summary.get("data", [])}
+        # Contributors say *why* a score landed where it did: which of deep,
+        # rem, latency, restfulness or timing pulled it down.
+        contribs = {d.get("day"): d.get("contributors")
+                    for d in summary.get("data", [])}
         nights = []
         for d in detail.get("data", []):
             day = f.pick(d, "day")
@@ -338,6 +372,7 @@ async def get_sleep(start_date: str | None = None,
                 "average_heart_rate": f.pick(d, "average_heart_rate"),
                 "average_hrv": f.pick(d, "average_hrv"),
                 "respiratory_rate": f.pick(d, "average_breath"),
+                "score_contributors": contribs.get(day),
             })
         return {"start_date": start_date, "end_date": end_date,
                 "nights": nights, "night_count": len(nights), **f.report()}
@@ -360,10 +395,16 @@ async def get_readiness(start_date: str | None = None,
             "day": f.pick(d, "day"),
             "readiness_score": f.pick(d, "score"),
             "temperature_deviation_c": f.pick(d, "temperature_deviation"),
+            "temperature_trend_deviation": f.pick(d, "temperature_trend_deviation"),
             "resting_heart_rate": f.pick(d, "contributors", "resting_heart_rate"),
             "hrv_balance": f.pick(d, "contributors", "hrv_balance"),
             "body_temperature": f.pick(d, "contributors", "body_temperature"),
             "recovery_index": f.pick(d, "contributors", "recovery_index"),
+            "activity_balance": f.pick(d, "contributors", "activity_balance"),
+            "sleep_balance": f.pick(d, "contributors", "sleep_balance"),
+            "sleep_regularity": f.pick(d, "contributors", "sleep_regularity"),
+            "previous_night": f.pick(d, "contributors", "previous_night"),
+            "previous_day_activity": f.pick(d, "contributors", "previous_day_activity"),
         } for d in data.get("data", [])]
         return {"start_date": start_date, "end_date": end_date,
                 "days": days, "day_count": len(days), **f.report()}
@@ -485,6 +526,13 @@ async def compare_periods(period_a_start: str, period_a_end: str,
 
 def _hours(seconds: Any) -> float | None:
     return round(seconds / 3600, 2) if isinstance(seconds, (int, float)) else None
+
+
+def _mins(seconds: Any) -> float | None:
+    """Oura reports durations in seconds unless stated otherwise. Naming a
+    seconds value "minutes" turns 31200 seconds of sitting into 31200 minutes,
+    which is 21 days."""
+    return round(seconds / 60, 1) if isinstance(seconds, (int, float)) else None
 
 
 def _minutes_between(start: Any, end: Any) -> float | None:
@@ -795,8 +843,18 @@ async def get_activity(start_date: str | None = None,
             "steps": f.pick(d, "steps"),
             "active_calories": f.pick(d, "active_calories"),
             "total_calories": f.pick(d, "total_calories"),
-            "sedentary_minutes": f.pick(d, "sedentary_time"),
-            "high_activity_minutes": f.pick(d, "high_activity_time"),
+            "target_calories": f.pick(d, "target_calories"),
+            "walking_equivalent_m": f.pick(d, "equivalent_walking_distance"),
+            "average_met_minutes": f.pick(d, "average_met_minutes"),
+            # Every *_time field is seconds in the API.
+            "sedentary_minutes": _mins(f.pick(d, "sedentary_time")),
+            "resting_minutes": _mins(f.pick(d, "resting_time")),
+            "low_activity_minutes": _mins(f.pick(d, "low_activity_time")),
+            "medium_activity_minutes": _mins(f.pick(d, "medium_activity_time")),
+            "high_activity_minutes": _mins(f.pick(d, "high_activity_time")),
+            "non_wear_minutes": _mins(f.pick(d, "non_wear_time")),
+            "inactivity_alerts": f.pick(d, "inactivity_alerts"),
+            "contributors": f.pick(d, "contributors"),
         } for d in data.get("data", [])]
         return {"start_date": start_date, "end_date": end_date,
                 "days": days, "day_count": len(days), **f.report()}
@@ -854,7 +912,16 @@ async def get_cardiovascular(start_date: str | None = None,
         try:
             data = await _get(f"/usercollection/{path}",
                               {"start_date": start_date, "end_date": end_date})
-            out[key] = data.get("data", [])
+            rows = data.get("data", [])
+            if key == "cardiovascular_age":
+                # vascular_age is the headline number: an age estimate, so a
+                # value below your real age is the good direction.
+                out[key] = [{"day": f.pick(r, "day"),
+                             "vascular_age": f.pick(r, "vascular_age"),
+                             "pulse_wave_velocity": f.pick(
+                                 r, "pulse_wave_velocity")} for r in rows]
+            else:
+                out[key] = rows
         except httpx.HTTPStatusError as e:
             out[key] = f"not available (HTTP {e.response.status_code})"
         except Exception as e:

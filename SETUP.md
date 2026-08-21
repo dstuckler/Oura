@@ -62,8 +62,14 @@ https://oura-mcp-2jaj.onrender.com/auth/callback
 No trailing slash, https not http. A mismatch here is the most common failure
 in the whole process.
 
-**Scopes:** tick all of `personal`, `daily`, `heartrate`, `session`, `spo2`,
-`workout`, `tag`.
+**Scopes:** tick all eight, exactly as spelled here:
+
+`email` · `personal` · `daily` · `heartrate` · `workout` · `tag` · `session` · `spo2Daily`
+
+Note **`spo2Daily`**, not `spo2`. The original handoff said `spo2`, which is
+not a real scope name. Getting this wrong does not produce an error: consent
+succeeds and `daily_spo2` simply returns nothing, which looks like an
+unsupported ring or a renamed field rather than a missing permission.
 
 **Website / privacy policy:** required, any valid URL works for a personal app.
 
