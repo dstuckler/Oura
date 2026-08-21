@@ -285,13 +285,27 @@ async def check_connection() -> dict:
     try:
         data = await _get("/usercollection/personal_info", {})
         f = _Fields()
-        return {
+        out = {
             "connected": True,
             "email": f.pick(data, "email"),
             "age": f.pick(data, "age"),
-            **f.report(),
-            "raw_personal_info": data,
         }
+        # Ring generation decides whether SpO2 and breathing data exist at all,
+        # so surface it here rather than leaving get_breathing to return an
+        # empty list that looks like a fault.
+        try:
+            rings = await _get("/usercollection/ring_configuration", {})
+            out["rings"] = [{
+                "hardware_type": r.get("hardware_type"),
+                "design": r.get("design"),
+                "colour": r.get("color"),
+                "set_up_at": r.get("set_up_at"),
+            } for r in rings.get("data", [])]
+        except Exception:  # noqa: BLE001 - diagnostics must not fail the check
+            out["rings"] = "could not read ring configuration"
+        out.update(f.report())
+        out["raw_personal_info"] = data
+        return out
     except Exception as e:
         return _err(e)
 
@@ -708,3 +722,222 @@ if __name__ == "__main__":
 
     app = RequireSecret(mcp.streamable_http_app())
     uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
+
+
+# --- Wider data coverage ---------------------------------------------------
+# Everything Oura v2 exposes, not just the sleep and breathing subset. The
+# endpoint names below come from the published v2 collection list. Field names
+# inside each are still unverified, which is exactly why _Fields reports
+# misses rather than returning silent nulls.
+
+ENDPOINTS = {
+    "daily_activity": "steps, calories and the activity score",
+    "daily_sleep": "nightly sleep score and contributors",
+    "daily_readiness": "readiness score and contributors",
+    "daily_spo2": "overnight blood oxygen and breathing disturbance",
+    "daily_stress": "daytime stress and recovery minutes",
+    "daily_resilience": "longer-term resilience classification",
+    "daily_cardiovascular_age": "cardiovascular age estimate",
+    "vO2_max": "estimated VO2 max",
+    "sleep": "detailed per-night sleep periods",
+    "sleep_time": "recommended bedtime windows",
+    "workout": "workouts, auto-detected and logged",
+    "session": "guided sessions: meditation, breathwork, rest",
+    "tag": "legacy user-entered tags",
+    "enhanced_tag": "structured user-entered tags",
+    "rest_mode_period": "rest mode periods",
+    "ring_configuration": "ring hardware, including generation",
+    "personal_info": "account profile",
+    "heartrate": "continuous heart rate samples (uses datetimes)",
+}
+
+# heartrate is bounded by timestamps, every other collection by dates.
+_DATETIME_ENDPOINTS = {"heartrate"}
+# These carry no date range at all; sending one returns a 400.
+_UNDATED_ENDPOINTS = {"personal_info", "ring_configuration"}
+
+
+@mcp.tool()
+async def list_available_data() -> dict:
+    """List every Oura data collection this connector can reach, with a short
+    description of each. Use this to find out what is available before calling
+    get_raw for something without a dedicated tool."""
+    return {
+        "endpoints": ENDPOINTS,
+        "note": ("Collections with a dedicated tool return tidied fields. "
+                 "Anything else is reachable through get_raw, which returns "
+                 "Oura's response unmodified."),
+    }
+
+
+@mcp.tool()
+async def get_raw(endpoint: str, start_date: str | None = None,
+                  end_date: str | None = None) -> dict:
+    """Fetch any Oura v2 collection and return its response unchanged.
+
+    The escape hatch: use it for data with no dedicated tool, or to see the
+    real field names when a tidied tool reports missing fields. Call
+    list_available_data for valid endpoint names. Dates are YYYY-MM-DD and are
+    ignored for collections that do not accept a range."""
+    name = endpoint.strip().strip("/").split("/")[-1]
+    if name not in ENDPOINTS:
+        return {"error": f"Unknown endpoint '{endpoint}'.",
+                "valid_endpoints": sorted(ENDPOINTS)}
+    try:
+        if name in _UNDATED_ENDPOINTS:
+            params: dict = {}
+        elif name in _DATETIME_ENDPOINTS:
+            s, e = _dates(start_date, end_date)
+            params = {"start_datetime": f"{s}T00:00:00+00:00",
+                      "end_datetime": f"{e}T23:59:59+00:00"}
+        else:
+            s, e = _dates(start_date, end_date)
+            params = {"start_date": s, "end_date": e}
+        data = await _get(f"/usercollection/{name}", params)
+        records = data.get("data", data) if isinstance(data, dict) else data
+        return {"endpoint": name, "params": params,
+                "record_count": len(records) if isinstance(records, list) else 1,
+                "data": data}
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_activity(start_date: str | None = None,
+                       end_date: str | None = None) -> dict:
+    """Daily activity: steps, calories burned, active and sedentary time, and
+    the activity score. Dates are YYYY-MM-DD. Defaults to the last 7 days."""
+    start_date, end_date = _dates(start_date, end_date)
+    try:
+        data = await _get("/usercollection/daily_activity",
+                          {"start_date": start_date, "end_date": end_date})
+        f = _Fields()
+        days = [{
+            "day": f.pick(d, "day"),
+            "activity_score": f.pick(d, "score"),
+            "steps": f.pick(d, "steps"),
+            "active_calories": f.pick(d, "active_calories"),
+            "total_calories": f.pick(d, "total_calories"),
+            "sedentary_minutes": f.pick(d, "sedentary_time"),
+            "high_activity_minutes": f.pick(d, "high_activity_time"),
+        } for d in data.get("data", [])]
+        return {"start_date": start_date, "end_date": end_date,
+                "days": days, "day_count": len(days), **f.report()}
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_stress(start_date: str | None = None,
+                     end_date: str | None = None) -> dict:
+    """Daytime stress and longer-term resilience: minutes spent in stress
+    versus recovery, and Oura's resilience classification. Dates are
+    YYYY-MM-DD. Defaults to the last 7 days."""
+    start_date, end_date = _dates(start_date, end_date)
+    try:
+        stress = await _get("/usercollection/daily_stress",
+                            {"start_date": start_date, "end_date": end_date})
+        f = _Fields()
+        days = [{
+            "day": f.pick(d, "day"),
+            "stress_high_minutes": f.pick(d, "stress_high"),
+            "recovery_high_minutes": f.pick(d, "recovery_high"),
+            "day_summary": f.pick(d, "day_summary"),
+        } for d in stress.get("data", [])]
+        out = {"start_date": start_date, "end_date": end_date,
+               "days": days, "day_count": len(days)}
+        try:
+            res = await _get("/usercollection/daily_resilience",
+                             {"start_date": start_date, "end_date": end_date})
+            out["resilience"] = [{
+                "day": f.pick(d, "day"),
+                "level": f.pick(d, "level"),
+                "contributors": f.pick(d, "contributors"),
+            } for d in res.get("data", [])]
+        except httpx.HTTPStatusError:
+            # Resilience is not available on every account or ring generation.
+            out["resilience"] = "not available on this account"
+        out.update(f.report())
+        return out
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_cardiovascular(start_date: str | None = None,
+                             end_date: str | None = None) -> dict:
+    """Cardiovascular age estimate and VO2 max. These update infrequently, so
+    a wide date range usually returns only a handful of records. Dates are
+    YYYY-MM-DD. Defaults to the last 30 days."""
+    start_date, end_date = _dates(start_date, end_date, default_days=30)
+    out: dict = {"start_date": start_date, "end_date": end_date}
+    f = _Fields()
+    for key, path in (("cardiovascular_age", "daily_cardiovascular_age"),
+                      ("vo2_max", "vO2_max")):
+        try:
+            data = await _get(f"/usercollection/{path}",
+                              {"start_date": start_date, "end_date": end_date})
+            out[key] = data.get("data", [])
+        except httpx.HTTPStatusError as e:
+            out[key] = f"not available (HTTP {e.response.status_code})"
+        except Exception as e:
+            return _err(e)
+    out.update(f.report())
+    return out
+
+
+@mcp.tool()
+async def get_heart_rate(start_date: str | None = None,
+                         end_date: str | None = None) -> dict:
+    """Continuous heart rate samples. This returns a lot of points, so it
+    summarises by default: count, range, mean, and the split between awake and
+    sleep samples. Use get_raw('heartrate', ...) for every individual sample.
+    Dates are YYYY-MM-DD. Defaults to the last 2 days, because the volume is
+    high."""
+    start_date, end_date = _dates(start_date, end_date, default_days=2)
+    try:
+        data = await _get("/usercollection/heartrate", {
+            "start_datetime": f"{start_date}T00:00:00+00:00",
+            "end_datetime": f"{end_date}T23:59:59+00:00"})
+        f = _Fields()
+        samples = data.get("data", [])
+        bpms = [f.pick(s, "bpm") for s in samples]
+        bpms = [b for b in bpms if isinstance(b, (int, float))]
+        by_source: dict[str, list] = {}
+        for s in samples:
+            by_source.setdefault(str(s.get("source", "unknown")), []).append(
+                s.get("bpm"))
+        return {
+            "start_date": start_date, "end_date": end_date,
+            "sample_count": len(samples),
+            "bpm_min": min(bpms) if bpms else None,
+            "bpm_max": max(bpms) if bpms else None,
+            "bpm_mean": _mean(bpms),
+            "by_source": {k: {"count": len(v), "mean": _mean(v)}
+                          for k, v in by_source.items()},
+            **f.report(),
+        }
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
+async def get_sessions(start_date: str | None = None,
+                       end_date: str | None = None) -> dict:
+    """Guided sessions (meditation, breathwork, rest) and any tags you entered
+    yourself, which is where notes like 'travelling' or 'alcohol' live. Useful
+    for explaining why a particular night differs. Dates are YYYY-MM-DD.
+    Defaults to the last 7 days."""
+    start_date, end_date = _dates(start_date, end_date)
+    out: dict = {"start_date": start_date, "end_date": end_date}
+    for key, path in (("sessions", "session"), ("tags", "enhanced_tag"),
+                      ("legacy_tags", "tag")):
+        try:
+            data = await _get(f"/usercollection/{path}",
+                              {"start_date": start_date, "end_date": end_date})
+            out[key] = data.get("data", [])
+        except httpx.HTTPStatusError as e:
+            out[key] = f"not available (HTTP {e.response.status_code})"
+        except Exception as e:
+            return _err(e)
+    return out

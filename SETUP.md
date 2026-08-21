@@ -44,7 +44,14 @@ Remaining steps are the ones that need your Oura login, so they are yours.
 
 ### 1. Register the Oura app
 
-At `cloud.ouraring.com`, developer area, create an application.
+Sign in at `cloud.ouraring.com`, then go straight to:
+
+```
+https://cloud.ouraring.com/oauth/applications
+```
+
+The developer area is not linked from the Oura app's normal navigation, so
+that direct address is the way in. Create an application there.
 
 **Redirect URI, exactly this:**
 
@@ -103,8 +110,27 @@ anything. That is the lock working, not a fault.
 
 ### 5. Test with real data
 
-Six tools should appear: `check_connection`, `get_sleep`, `get_readiness`,
-`get_breathing`, `get_workouts`, `compare_periods`.
+Thirteen tools should appear, covering everything Oura v2 exposes:
+
+| Tool | Data |
+|---|---|
+| `check_connection` | account, and which ring you have |
+| `get_sleep` | nightly sleep, stages, efficiency |
+| `get_readiness` | readiness score and contributors |
+| `get_breathing` | SpO2, breathing disturbance, respiratory rate |
+| `get_activity` | steps, calories, active and sedentary time |
+| `get_stress` | daytime stress, recovery, resilience |
+| `get_cardiovascular` | cardiovascular age, VO2 max |
+| `get_heart_rate` | continuous heart rate, summarised |
+| `get_workouts` | workouts |
+| `get_sessions` | meditation and breathwork, plus your own tags |
+| `compare_periods` | two date ranges side by side |
+| `list_available_data` | what else is reachable |
+| `get_raw` | any collection, unmodified |
+
+`get_raw` is the escape hatch. If a tidied tool reports missing fields, call
+`get_raw` on the same collection to see the real field names Oura is
+returning, then the code can be corrected against reality.
 
 Run `check_connection` first, then:
 
