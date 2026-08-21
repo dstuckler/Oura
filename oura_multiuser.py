@@ -14,8 +14,8 @@ How it differs
 The MCP access token IS the user's Oura access token. Claude registers itself,
 /authorize redirects to Oura, the callback swaps the code for Oura tokens and
 returns them to Claude as the MCP tokens. Later calls arrive bearing the
-user's own token, which is forwarded to Oura unchanged. Nothing durable is
-written.
+user's own token, which is forwarded to Oura unchanged. No token is written
+down; see the storage note below for the one thing that is.
 
 Every tool comes from oura_mcp.py unchanged. Only the token source differs,
 through the TOKEN_PROVIDER hook there: the single-user server reads a disk,
@@ -62,7 +62,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import (AccessToken, AuthorizationCode,
                                       AuthorizationParams,
                                       OAuthAuthorizationServerProvider,
-                                      RefreshToken)
+                                      RefreshToken, TokenError)
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
@@ -213,7 +213,11 @@ class OuraBroker(OAuthAuthorizationServerProvider):
         """Hand Claude the Oura tokens themselves, then drop our copy."""
         entry = self.codes.pop(authorization_code.code, None)
         if not entry:
-            raise ValueError("unknown or already-used authorization code")
+            # Same reasoning as the refresh path: a bare exception here is a
+            # 500, which tells the client nothing it can act on.
+            raise TokenError("invalid_grant",
+                             "This login link has already been used or has "
+                             "expired. Start the connection again.")
         _code, tokens = entry
         return OAuthToken(
             access_token=tokens["access_token"],
@@ -242,16 +246,40 @@ class OuraBroker(OAuthAuthorizationServerProvider):
 
     async def exchange_refresh_token(self, client, refresh_token,
                                      scopes: list[str]) -> OAuthToken:
-        """Proxy the refresh to Oura. The client secret never leaves here."""
-        async with httpx.AsyncClient(timeout=TIMEOUT) as http:
-            r = await http.post(core.OURA_TOKEN_URL, data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token.token,
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-            })
-            r.raise_for_status()
-            t = r.json()
+        """Proxy the refresh to Oura. The client secret never leaves here.
+
+        A refusal from Oura is reported as invalid_grant, which is the
+        client's signal to start a fresh authorisation. Letting the underlying
+        HTTP error escape instead produced a 500, and a 500 does not mean
+        anything in OAuth: the client cannot tell "your login has ended, sign
+        in again" from "this server is broken, try later", so a user whose
+        access was revoked would sit in a retry loop rather than being offered
+        the login that would fix it.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT) as http:
+                r = await http.post(core.OURA_TOKEN_URL, data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token.token,
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                })
+        except httpx.HTTPError as e:
+            # Oura unreachable is not the user's login failing. Saying
+            # invalid_grant here would throw away a good refresh token and
+            # force a needless re-login over a transient network fault.
+            log.warning("refresh transport error: %s", type(e).__name__)
+            raise TokenError("invalid_request",
+                             "Could not reach Oura to refresh. Try again "
+                             "shortly; you have not been signed out.") from e
+        if r.status_code >= 400:
+            # Status only. A failed token response can echo credentials.
+            log.warning("Oura refused refresh: %s", r.status_code)
+            raise TokenError(
+                "invalid_grant",
+                "Oura would not renew this session. Reconnect the connector "
+                "to sign in again.")
+        t = r.json()
         return OAuthToken(
             access_token=t["access_token"],
             # Keep the old refresh token when Oura returns none, rather than
