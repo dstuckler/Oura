@@ -1082,6 +1082,48 @@ def _offset_hours(offset: str) -> float:
     return sign * (int(hh) + int(mm) / 60)
 
 
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """The nth given weekday of a month; n=-1 means the last one."""
+    days = [date(year, month, d)
+            for d in range(1, (date(year, month % 12 + 1, 1)
+                               - timedelta(days=1)).day + 1)]
+    matches = [d for d in days if d.weekday() == weekday]
+    return matches[n if n < 0 else n - 1]
+
+
+def _dst_boundaries(year: int) -> set[date]:
+    """Clock-change Sundays for the EU and US in a given year.
+
+    Both are covered because either can appear in one record: a European home
+    offset shifts on the EU dates, a US one on the US dates, and someone who
+    moves between them sees both.
+    """
+    return {
+        _nth_weekday(year, 3, 6, -1),    # EU spring, last Sunday in March
+        _nth_weekday(year, 10, 6, -1),   # EU autumn, last Sunday in October
+        _nth_weekday(year, 3, 6, 2),     # US spring, second Sunday in March
+        _nth_weekday(year, 11, 6, 1),    # US autumn, first Sunday in November
+    }
+
+
+def _is_clock_change(day: str, prev_off: str, new_off: str) -> bool:
+    """True when an offset change looks like daylight saving, not travel.
+
+    Two conditions together, because either alone gives false positives: the
+    shift is exactly one hour, and it lands within a day of a clock-change
+    Sunday. A real flight of exactly one hour on that precise weekend would be
+    misread, which is a rarer and much smaller error than calling a whole
+    winter a trip abroad.
+    """
+    try:
+        d = date.fromisoformat(day)
+    except (TypeError, ValueError):
+        return False
+    if abs(_offset_hours(new_off) - _offset_hours(prev_off)) != 1.0:
+        return False
+    return any(abs((d - b).days) <= 1 for b in _dst_boundaries(d.year))
+
+
 @mcp.tool()
 async def find_travel_periods(start_date: str | None = None,
                               end_date: str | None = None,
@@ -1113,28 +1155,53 @@ async def find_travel_periods(start_date: str | None = None,
         if not nights:
             return {"error": "No sleep records with a timezone in this range."}
 
+        # Label each night with a zone rather than a raw offset. A daylight
+        # saving change shifts the offset without moving anyone, so the label
+        # carries across it. Without this, one European winter reads as a
+        # 36-night trip and can out-vote the real home for the count below.
+        zoned: list[tuple[str, str, str]] = []   # day, zone label, offset
+        zone = nights[0][1]
+        prev_off = nights[0][1]
+        clock_changes = []
+        for day, off in nights:
+            if off != prev_off:
+                if _is_clock_change(day, prev_off, off):
+                    clock_changes.append(
+                        {"day": day, "from": prev_off, "to": off})
+                else:
+                    zone = off
+                prev_off = off
+            zoned.append((day, zone, off))
+
         counts: dict[str, int] = {}
-        for _, o in nights:
-            counts[o] = counts.get(o, 0) + 1
+        for _, z, _o in zoned:
+            counts[z] = counts.get(z, 0) + 1
         home = max(counts, key=lambda k: counts[k])
 
-        # Collapse consecutive nights sharing an offset into one run.
+        # Collapse consecutive nights sharing a zone into one run.
         runs = []
-        for day, off in nights:
-            if runs and runs[-1]["utc_offset"] == off:
+        for day, z, off in zoned:
+            if runs and runs[-1]["zone"] == z:
                 runs[-1]["end_day"] = day
                 runs[-1]["nights"] += 1
+                runs[-1]["offsets"].add(off)
             else:
-                runs.append({"start_day": day, "end_day": day,
-                             "utc_offset": off, "nights": 1})
+                runs.append({"start_day": day, "end_day": day, "zone": z,
+                             "offsets": {off}, "nights": 1})
+        for r in runs:
+            offs = sorted(r.pop("offsets"))
+            # A run spanning a clock change legitimately holds two offsets.
+            r["utc_offset"] = "/".join(offs) if len(offs) > 1 else offs[0]
 
+        # Compare zones, not printed offsets: a run spanning a clock change
+        # carries a combined "+01:00/+02:00" label that is not a number.
         trips = [{**r,
                   "hours_from_home": round(
-                      _offset_hours(r["utc_offset"]) - _offset_hours(home), 1),
-                  "direction": ("east" if _offset_hours(r["utc_offset"])
+                      _offset_hours(r["zone"]) - _offset_hours(home), 1),
+                  "direction": ("east" if _offset_hours(r["zone"])
                                 > _offset_hours(home) else "west")}
                  for r in runs
-                 if r["utc_offset"] != home and r["nights"] >= min_nights]
+                 if r["zone"] != home and r["nights"] >= min_nights]
 
         out = {
             "range": f"{start_date} to {end_date}",
@@ -1143,8 +1210,17 @@ async def find_travel_periods(start_date: str | None = None,
             "home_nights": counts[home],
             "trips": trips,
             "trip_count": len(trips),
-            "offsets_seen": counts,
+            "nights_per_zone": counts,
         }
+        if clock_changes:
+            # Reported so the reader can see they were considered and
+            # discounted, rather than wondering why an offset change is absent
+            # from the trip list.
+            out["daylight_saving_changes"] = clock_changes
+            out["note"] = (
+                "Offset changes on a clock-change weekend were treated as "
+                "daylight saving, not travel. A one-hour shift landing exactly "
+                "on that Sunday is assumed to be the clock, not a flight.")
         thin = [t for t in trips if t["nights"] < 3]
         if thin:
             out["caution"] = (
