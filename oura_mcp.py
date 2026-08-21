@@ -486,28 +486,50 @@ async def get_breathing(start_date: str | None = None,
     diagnose anything."""
     start_date, end_date = _dates(start_date, end_date)
     try:
-        spo2 = await _get("/usercollection/daily_spo2",
-                          {"start_date": start_date, "end_date": end_date})
+        # Respiratory rate lives on the sleep collection, SpO2 and the
+        # disturbance index on daily_spo2, and the two are granted by
+        # different scopes. Fetch them independently so losing one does not
+        # discard the other: an account without the SpO2 scope still has a
+        # real breaths-per-minute figure for every night, and returning only
+        # an error would hide data the user does have.
         sleep = await _get("/usercollection/sleep",
                            {"start_date": start_date, "end_date": end_date})
+        spo2: dict = {"data": []}
+        spo2_error = None
+        try:
+            spo2 = await _get("/usercollection/daily_spo2",
+                              {"start_date": start_date, "end_date": end_date})
+        except httpx.HTTPStatusError as e:
+            spo2_error = _err(e)["error"]
         f = _Fields()
         # Main night only. Keying every period by day let a late fragment,
         # which carries no average_breath, overwrite the real night's value
         # and report the respiratory rate as missing.
         main, _ = _main_sleep(sleep.get("data", []))
         breath = {day: f.pick(d, "average_breath") for day, d in main.items()}
+        by_day = {f.pick(d, "day"): d for d in spo2.get("data", [])}
+        # Drive the rows off the nights actually slept, not off the SpO2
+        # response, so the table still has a row per night when SpO2 is absent.
         nights = []
-        for d in spo2.get("data", []):
-            day = f.pick(d, "day")
+        for day in sorted(set(breath) | set(by_day)):
+            d = by_day.get(day)
             nights.append({
                 "day": day,
-                "spo2_avg_pct": f.pick(d, "spo2_percentage", "average"),
-                "breathing_disturbance_index": f.pick(
-                    d, "breathing_disturbance_index"),
+                "spo2_avg_pct": (f.pick(d, "spo2_percentage", "average")
+                                 if d else None),
+                "breathing_disturbance_index": (
+                    f.pick(d, "breathing_disturbance_index") if d else None),
                 "respiratory_rate": breath.get(day),
             })
         out = {"start_date": start_date, "end_date": end_date,
                "nights": nights, "night_count": len(nights), **f.report()}
+        if spo2_error:
+            out["spo2_unavailable"] = spo2_error
+            out["what_you_still_have"] = (
+                "respiratory_rate is from the sleep collection and is "
+                "unaffected. spo2_avg_pct and breathing_disturbance_index are "
+                "null because that collection was refused, not because the "
+                "readings were low.")
         if not nights:
             out["note"] = ("No SpO2 records returned for this range. Overnight "
                            "SpO2 needs a Gen 3 ring or Ring 4, and Oura does "
