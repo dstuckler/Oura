@@ -499,9 +499,18 @@ async def get_sleep(start_date: str | None = None,
 @mcp.tool()
 async def get_readiness(start_date: str | None = None,
                         end_date: str | None = None) -> dict:
-    """Daily readiness score and its contributors, including resting heart
-    rate, HRV balance and body temperature deviation. Dates are YYYY-MM-DD.
-    Defaults to the last 7 days."""
+    """Daily readiness score, its contributors, and body temperature
+    deviation in degrees Celsius. Dates are YYYY-MM-DD. Defaults to the last
+    7 days.
+
+    The values under contributor_scores_1_to_100 are scores out of 100 saying
+    how much each factor helped or hurt that day's readiness. They are NOT the
+    measurements they are named after: a resting_heart_rate of 1 means that
+    factor scored badly, not a pulse of 1 beat per minute. Never report them
+    as physiological readings.
+
+    For real beats per minute use get_sleep, which returns average and lowest
+    heart rate per night, or get_heart_rate for the continuous samples."""
     start_date, end_date = _dates(start_date, end_date)
     try:
         data = await _get("/usercollection/daily_readiness",
@@ -512,15 +521,18 @@ async def get_readiness(start_date: str | None = None,
             "readiness_score": f.pick(d, "score"),
             "temperature_deviation_c": f.pick(d, "temperature_deviation"),
             "temperature_trend_deviation": f.pick(d, "temperature_trend_deviation"),
-            "resting_heart_rate": f.pick(d, "contributors", "resting_heart_rate"),
-            "hrv_balance": f.pick(d, "contributors", "hrv_balance"),
-            "body_temperature": f.pick(d, "contributors", "body_temperature"),
-            "recovery_index": f.pick(d, "contributors", "recovery_index"),
-            "activity_balance": f.pick(d, "contributors", "activity_balance"),
-            "sleep_balance": f.pick(d, "contributors", "sleep_balance"),
-            "sleep_regularity": f.pick(d, "contributors", "sleep_regularity"),
-            "previous_night": f.pick(d, "contributors", "previous_night"),
-            "previous_day_activity": f.pick(d, "contributors", "previous_day_activity"),
+            # Every contributor is documented as a score "in range [1, 100]",
+            # not the measurement it is named after. Exposed flat, they read
+            # as the real thing: "resting_heart_rate": 1 looks like a pulse of
+            # 1 rather than a low contribution to the day's score. Nested
+            # under a name that says what they are, and never flattened.
+            "contributor_scores_1_to_100": {
+                k: f.pick(d, "contributors", k) for k in (
+                    "resting_heart_rate", "hrv_balance", "body_temperature",
+                    "recovery_index", "activity_balance", "sleep_balance",
+                    "sleep_regularity", "previous_night",
+                    "previous_day_activity")
+            },
         } for d in data.get("data", [])]
         return {"start_date": start_date, "end_date": end_date,
                 "days": days, "day_count": len(days), **f.report()}
@@ -1046,8 +1058,11 @@ async def get_stress(start_date: str | None = None,
         f = _Fields()
         days = [{
             "day": f.pick(d, "day"),
-            "stress_high_minutes": f.pick(d, "stress_high"),
-            "recovery_high_minutes": f.pick(d, "recovery_high"),
+            # Documented "in seconds", like every other *_time and *_high
+            # field. Reported raw under a "_minutes" label, a normal day's
+            # 19800 read as 19800 minutes, which is 330 hours.
+            "stress_high_minutes": _mins(f.pick(d, "stress_high")),
+            "recovery_high_minutes": _mins(f.pick(d, "recovery_high")),
             "day_summary": f.pick(d, "day_summary"),
         } for d in stress.get("data", [])]
         out = {"start_date": start_date, "end_date": end_date,
