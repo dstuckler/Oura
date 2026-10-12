@@ -114,11 +114,13 @@ CLIENT_STORE = Path(os.environ.get("CLIENT_STORE",
 # never refreshed, and the login stayed dead until reconnected by hand. The
 # logs showed exactly that: a month with no request to /token at all.
 TOKEN_PREFIX = "v1"
-EXPIRY_SLACK = 60
 
 
 def _wrap(oura_token: str, expires_in: int) -> str:
-    expires_at = int(time.time()) + int(expires_in) - EXPIRY_SLACK
+    # No slack subtracted. Claude is told the same expires_in, so the server
+    # must not call a token expired before Claude does, or Claude sees a 401
+    # for a token it believes is current.
+    expires_at = int(time.time()) + int(expires_in)
     return f"{TOKEN_PREFIX}.{expires_at}.{oura_token}"
 
 
@@ -270,14 +272,20 @@ class OuraBroker(OAuthAuthorizationServerProvider):
         data on the way.
 
         What is checked here is the expiry written into the token, so that
-        an expired one is answered with 401 and Claude refreshes it. A bare
-        Oura token from before the expiry was added is refused the same way,
-        which moves those users onto the wrapped form through one refresh
-        rather than another manual reconnect.
+        an expired one is answered with 401 and Claude refreshes it.
+
+        A bare Oura token from before the expiry was added is let through
+        unchecked, as before. Refusing it was tried and was wrong: Claude
+        answered the 401 by asking for a fresh login rather than refreshing,
+        so it would have signed out every user whose login still worked.
         """
-        parsed = _unwrap(token) if token else None
-        if parsed is None:
+        if not token:
             return None
+        parsed = _unwrap(token)
+        if parsed is None:
+            if token.startswith(TOKEN_PREFIX + "."):
+                return None  # claims the wrapped form but is not valid in it
+            return AccessToken(token=token, client_id="oura", scopes=SCOPES)
         expires_at, oura_token = parsed
         return AccessToken(token=oura_token, client_id="oura", scopes=SCOPES,
                            expires_at=expires_at)

@@ -82,12 +82,15 @@ honestly.
    came back as an ordinary tool error with HTTP 200. The token Claude holds
    is now `v1.<expiry>.<oura token>`: an expired one is answered 401, Claude
    refreshes through `/token`, and Oura only ever sees the inner token.
-   Still nothing is stored. A bare token from before this change is also
-   answered 401, so existing users move over through one refresh. Verified
-   locally against a simulated Oura on mcp 1.28 and 1.30: login, expiry,
-   refresh, refused refresh. Not verified: that Claude's refresh after the
-   401 succeeds against the live server. That shows on first use after
-   deploy.
+   Still nothing is stored. Verified locally against a simulated Oura on
+   mcp 1.28 and 1.30: login, expiry, refresh, refused refresh.
+
+   Observed live on 12 October: answered 401 for a bare pre-change token,
+   Claude did not call `/token` at all and asked for a fresh login instead.
+   So bare tokens are let through unchecked again, as before, rather than
+   signing out users whose login still works. Still unknown: whether Claude
+   refreshes a wrapped token when its expiry passes. Watch for the first
+   `refreshed a session` line in the logs about a month after a login.
 4. **Oura app approval**, to pass 10 users. Start early; it is someone
    else's timeline.
 5. **Rename the app.** The consent screen currently reads "Oura Personal
