@@ -274,18 +274,16 @@ class OuraBroker(OAuthAuthorizationServerProvider):
         What is checked here is the expiry written into the token, so that
         an expired one is answered with 401 and Claude refreshes it.
 
-        A bare Oura token from before the expiry was added is let through
-        unchecked, as before. Refusing it was tried and was wrong: Claude
-        answered the 401 by asking for a fresh login rather than refreshing,
-        so it would have signed out every user whose login still worked.
+        A bare Oura token from before the expiry was added is refused the
+        same way. Its age is unknown and most such tokens had already
+        expired, so letting it through meant silent failures. Refused, it
+        moves onto the wrapped form through one refresh: seen live on 12
+        October, when the Claude app took the 401, refreshed through /token
+        and carried on without asking the user anything.
         """
-        if not token:
-            return None
-        parsed = _unwrap(token)
+        parsed = _unwrap(token) if token else None
         if parsed is None:
-            if token.startswith(TOKEN_PREFIX + "."):
-                return None  # claims the wrapped form but is not valid in it
-            return AccessToken(token=token, client_id="oura", scopes=SCOPES)
+            return None
         expires_at, oura_token = parsed
         return AccessToken(token=oura_token, client_id="oura", scopes=SCOPES,
                            expires_at=expires_at)

@@ -85,12 +85,13 @@ honestly.
    Still nothing is stored. Verified locally against a simulated Oura on
    mcp 1.28 and 1.30: login, expiry, refresh, refused refresh.
 
-   Observed live on 12 October: answered 401 for a bare pre-change token,
-   Claude did not call `/token` at all and asked for a fresh login instead.
-   So bare tokens are let through unchecked again, as before, rather than
-   signing out users whose login still works. Still unknown: whether Claude
-   refreshes a wrapped token when its expiry passes. Watch for the first
-   `refreshed a session` line in the logs about a month after a login.
+   A bare token from before this change is also answered 401. Observed
+   live on 12 October: a Claude app client took that 401, refreshed through
+   `/token` and carried on with no prompt (`refreshed a session` in the
+   logs). The Claude Code session used for testing did not refresh and
+   asked for a fresh login, so not every client behaves the same; those
+   users see a reconnect prompt, not a silent failure. Still to watch: the
+   first refresh of a wrapped token when its own expiry passes.
 4. **Oura app approval**, to pass 10 users. Start early; it is someone
    else's timeline.
 5. **Rename the app.** The consent screen currently reads "Oura Personal
