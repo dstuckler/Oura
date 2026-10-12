@@ -73,11 +73,27 @@ honestly.
    token had been valid throughout. Registrations now live on a Render disk
    at `/var/data`, written 0600 through a temp file and rename. Verified to
    survive a restart and to contain no access or refresh token.
-3. **Oura app approval**, to pass 10 users. Start early; it is someone
+3. ~~Make Claude refresh expired logins.~~ Done. The connector went dead
+   about a month after login and stayed dead: every tool returned Oura's
+   401, and the Render logs for the preceding 30 days held no request to
+   `/token` at all. Claude only refreshes when the server answers 401, and
+   the server accepted any bearer because it had no expiry to check, so the
+   stale token was waved through, Oura refused it inside the tool, and that
+   came back as an ordinary tool error with HTTP 200. The token Claude holds
+   is now `v1.<expiry>.<oura token>`: an expired one is answered 401, Claude
+   refreshes through `/token`, and Oura only ever sees the inner token.
+   Still nothing is stored. A bare token from before this change is also
+   answered 401, so existing users move over through one refresh. Verified
+   locally against a simulated Oura on mcp 1.28 and 1.30: login, expiry,
+   refresh, refused refresh. Not verified: that Claude's refresh after the
+   401 succeeds against the live server. That shows on first use after
+   deploy.
+4. **Oura app approval**, to pass 10 users. Start early; it is someone
    else's timeline.
-4. **Rename the app.** The consent screen currently reads "Oura Personal
-   MCP", which is wrong for a shared tool.
-5. **Privacy policy**, per the wording above.
+5. **Rename the app.** The consent screen currently reads "Oura Personal
+   MCP", which is wrong for a shared tool. Both Render services use this
+   one Oura app registration.
+6. **Privacy policy**, per the wording above.
 
 ## Why the single-user server still exists
 

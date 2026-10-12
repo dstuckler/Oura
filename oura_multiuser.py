@@ -103,6 +103,38 @@ CODE_TTL = 300
 CLIENT_STORE = Path(os.environ.get("CLIENT_STORE",
                                    "/var/data/oauth_clients.json"))
 
+# The token Claude holds is the Oura token with its expiry written in front:
+# "v1.<unix expiry>.<oura access token>". This is how the server knows a
+# token has expired without keeping a record of having issued it.
+#
+# Why it is needed: Claude only refreshes when the server answers 401. With
+# the bare Oura token there was no expiry to check, so every request was let
+# through, Oura refused the stale token inside the tool, and the tool
+# returned that as an ordinary error with HTTP 200. Claude never saw a 401,
+# never refreshed, and the login stayed dead until reconnected by hand. The
+# logs showed exactly that: a month with no request to /token at all.
+TOKEN_PREFIX = "v1"
+EXPIRY_SLACK = 60
+
+
+def _wrap(oura_token: str, expires_in: int) -> str:
+    expires_at = int(time.time()) + int(expires_in) - EXPIRY_SLACK
+    return f"{TOKEN_PREFIX}.{expires_at}.{oura_token}"
+
+
+def _unwrap(token: str) -> tuple[int, str] | None:
+    """(expiry, Oura token), or None for anything not in the wrapped form.
+
+    The expiry is an integer and cannot contain a dot, so splitting twice is
+    unambiguous whatever characters the Oura token itself uses.
+    """
+    parts = token.split(".", 2)
+    if len(parts) != 3 or parts[0] != TOKEN_PREFIX or not parts[1].isdigit():
+        return None
+    if not parts[2]:
+        return None
+    return int(parts[1]), parts[2]
+
 
 async def _token_from_request() -> str:
     """The caller's own Oura token, taken off this request.
@@ -219,26 +251,36 @@ class OuraBroker(OAuthAuthorizationServerProvider):
                              "This login link has already been used or has "
                              "expired. Start the connection again.")
         _code, tokens = entry
+        expires_in = int(tokens.get("expires_in", 86400))
         return OAuthToken(
-            access_token=tokens["access_token"],
+            access_token=_wrap(tokens["access_token"], expires_in),
             refresh_token=tokens.get("refresh_token"),
-            expires_in=tokens.get("expires_in", 86400),
+            expires_in=expires_in,
             scope=" ".join(SCOPES),
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """Accept the bearer without local verification.
+        """Accept an unexpired bearer without asking Oura about it.
 
         The token is Oura's, not ours: there is no key here to check it
-        against and no record of having issued it, and verifying would cost a
-        round trip to Oura on every request. The real check happens where it
-        counts, when the forwarded token is used and Oura accepts or refuses
-        it. A forged token gets past this line and straight into a 401 from
-        Oura, having reached nobody's data on the way.
+        against, and verifying would cost a round trip to Oura on every
+        request. The real check happens where it counts, when the forwarded
+        token is used and Oura accepts or refuses it. A forged token gets past
+        this line and straight into a 401 from Oura, having reached nobody's
+        data on the way.
+
+        What is checked here is the expiry written into the token, so that
+        an expired one is answered with 401 and Claude refreshes it. A bare
+        Oura token from before the expiry was added is refused the same way,
+        which moves those users onto the wrapped form through one refresh
+        rather than another manual reconnect.
         """
-        if not token:
+        parsed = _unwrap(token) if token else None
+        if parsed is None:
             return None
-        return AccessToken(token=token, client_id="oura", scopes=SCOPES)
+        expires_at, oura_token = parsed
+        return AccessToken(token=oura_token, client_id="oura", scopes=SCOPES,
+                           expires_at=expires_at)
 
     async def load_refresh_token(self, client, refresh_token: str):
         return RefreshToken(token=refresh_token,
@@ -280,12 +322,14 @@ class OuraBroker(OAuthAuthorizationServerProvider):
                 "Oura would not renew this session. Reconnect the connector "
                 "to sign in again.")
         t = r.json()
+        expires_in = int(t.get("expires_in", 86400))
+        log.info("refreshed a session")
         return OAuthToken(
-            access_token=t["access_token"],
+            access_token=_wrap(t["access_token"], expires_in),
             # Keep the old refresh token when Oura returns none, rather than
             # replacing it with nothing and locking the user out.
             refresh_token=t.get("refresh_token", refresh_token.token),
-            expires_in=t.get("expires_in", 86400),
+            expires_in=expires_in,
             scope=" ".join(SCOPES),
         )
 
